@@ -245,19 +245,26 @@ done
 
 # --- Zygisk activation (GHOSTLOCK_ZYGISK=1) -----------------------------
 # Runs AFTER a successful chain. Applies NeoZygisk's sepolicy rules,
-# re-enables the module, starts its monitor, and kill -9's the zygote
-# (NOT ctl.restart — the ptrace monitor keys on zygote death events;
-# ctl.restart crashes it. Verified working 2026-10-11.)
+# re-enables the modules, starts the NeoZygisk monitor and Vector's daemon,
+# then kill -9's the zygote (NOT ctl.restart — the ptrace monitor keys on
+# zygote death events; ctl.restart crashes it. Verified working 2026-10-11.)
 GHOSTLOCK_ZYGISK=${GHOSTLOCK_ZYGISK:-0}
 if [ "$GHOSTLOCK_ZYGISK" = "1" ]; then
   MODDIR=/data/adb/modules/zygisksu
   STAGE=/data/adb/neozygisk
+  VECTOR=/data/adb/modules/zygisk_vector
 
   echo "[*] zygisk: applying sepolicy rules"
   "$ADB" -s "$ADB_TARGET" shell "su -c 'cd $MODDIR && $REMOTE_KSUD sepolicy apply sepolicy.rule 2>&1'"
+  
+  echo "[*] vector: applying sepolicy rules"
+  "$ADB" -s "$ADB_TARGET" shell "su -c '$REMOTE_KSUD sepolicy apply /data/adb/modules/zygisk_vector/sepolicy.rule 2>&1'"
 
-  echo "[*] zygisk: clearing any stale monitor processes"
-  "$ADB" -s "$ADB_TARGET" shell "su -c 'pkill -x zygisk-ptrace32; pkill -x zygiskd32; pkill -x zygisk-ptrace; pkill -x zygiskd; sleep 1; true'"
+  echo "[*] vector: enabling..."
+  "$ADB" -s "$ADB_TARGET" shell "su -c 'rm -f $VECTOR/disable'"
+
+  echo "[*] zygisk/vector: clearing any stale monitor and daemon processes"
+  "$ADB" -s "$ADB_TARGET" shell "su -c 'pkill -x zygisk-ptrace32; pkill -x zygiskd32; pkill -x zygisk-ptrace; pkill -x zygiskd; pkill -x vectord; sleep 1; true'"
 
   echo "[*] zygisk: enabling module + starting monitor"
   "$ADB" -s "$ADB_TARGET" shell "su -c 'rm -f $MODDIR/disable; nohup sh $MODDIR/post-fs-data.sh > /data/local/tmp/zygisk-init.log 2>&1 &'"
@@ -270,6 +277,13 @@ if [ "$GHOSTLOCK_ZYGISK" = "1" ]; then
   done
   sleep 2   # small settle margin even after state shows tracing
 
+  # Start vectord right before the zygote kill, so the respawned
+  # system_server forks with both zygiskd and vectord up. Started via
+  # KernelSU's busybox: service.sh needs busybox `unshare --propagation`
+  # (toybox's unshare doesn't support it).
+  echo "[*] vector: starting daemon"
+  "$ADB" -s "$ADB_TARGET" shell "su -c 'ASH_STANDALONE=1 /data/adb/ksu/bin/busybox sh $VECTOR/service.sh >/dev/null 2>&1'"
+  
   echo "[*] zygisk: killing zygote (monitor injects the respawn)"
   "$ADB" -s "$ADB_TARGET" shell "su -c 'kill -9 \$(pidof zygote)'"
 
@@ -287,6 +301,13 @@ if [ "$GHOSTLOCK_ZYGISK" = "1" ]; then
   done
   if [ "${ST:-0}" -lt 1 ]; then
     echo "[-] zygisk: injection not confirmed — check $STAGE/module.prop on device"
+  fi
+
+  VD=$(timeout 10 "$ADB" -s "$ADB_TARGET" shell "su -c 'pidof vectord'" 2>/dev/null | tr -d '\r')
+  if [ -n "$VD" ]; then
+    echo "[+] vector: vectord running (pid $VD)"
+  else
+    echo "[-] vector: vectord not running — start it with: ASH_STANDALONE=1 /data/adb/ksu/bin/busybox sh $VECTOR/service.sh"
   fi
 fi
 
